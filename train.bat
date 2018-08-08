@@ -6,14 +6,14 @@ SET batch_size=2
 SET dropout=True
 SET pad=True
 SET target_size=50,50,50
-SET save_root=results\pixelcnn3d_gated_pad_dropout
+SET save_root=results\pixelcnn3d_gated_pad_dropout_2resblocks_weighted
 SET load_data_root=data\lectin594
 
 REM Less relevant ones 
-SET nb_res_blocks=1
-SET nb_filters_d=1024
+SET nb_res_blocks=2
+SET nb_filters_d=256
 SET continue_training=False
-SET loss=categorical_crossentropy
+SET loss=weighted_categorical_crossentropy
 
 
 python -m tests.train3d --model_type %model_type% --nb_epoch %nb_epoch% --batch_size %batch_size% --pad %pad% --loss %loss%^
