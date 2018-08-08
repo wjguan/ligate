@@ -1,6 +1,5 @@
 import argparse, os, zarr, sys, glob
 import numpy as np
-from sklearn.utils.class_weight import compute_class_weight 
 from ligate.utils import * 
 from distutils.util import strtobool
 
@@ -9,7 +8,7 @@ def train():
     import tensorflow as tf 
     config = tf.ConfigProto()
     config.gpu_options.allow_growth = True
-    config.gpu_options.per_process_gpu_memory_fraction = 0.85
+    config.gpu_options.per_process_gpu_memory_fraction = 0.9
     from keras.backend.tensorflow_backend import set_session
     set_session(tf.Session(config=config))
     
@@ -18,9 +17,10 @@ def train():
     parser.add_argument("--model_type", help="Gated or vanilla [Required]", type=str, metavar="INT")
     parser.add_argument("--nb_epoch", help="Number of epochs [Required]", type=int, metavar="INT")
     parser.add_argument("--batch_size", help="Minibatch size [Required]", type=int, metavar="INT")
+    parser.add_argument("--min_mask_size", help="randomly sample rectangular masks with min size [Required], Example: (5,5,5)", metavar="MIN_MASK_SIZE")
+    parser.add_argument("--max_mask_size", help="randomly sample rectangular masks with max size [Required], Example: (25,25,25)", metavar="MAX_MASK_SIZE")
     parser.add_argument("--nb_res_blocks", help="Number of residual blocks. (default: 1)", metavar="INT")
-    parser.add_argument("--nb_filters_h", help="Number of filters for each layer (or double this amount). (default: 128)", metavar="INT")
-    parser.add_argument("--nb_filters_d", help="Number of filters for penultimate layers. (default: 1024)", metavar="INT")
+    parser.add_argument("--nb_filters", help="Number of filters for each layer (or double this amount). (default: 128)", metavar="INT")
     parser.add_argument("--filter_size_1st", help="Filter size for the first layer. (default: (7,7,7))", metavar="INT,INT,INT")
     parser.add_argument("--filter_size", help="Filter size for the subsequent layers. (default: (3,3,3))", metavar="INT,INT,INT")
     parser.add_argument("--optimizer", help="SGD optimizer (default: adam)", type=str, metavar="OPT_NAME")
@@ -44,7 +44,7 @@ def train():
         from ligate.models import PixelCNN3D
         print("it's not gated")
     elif args.model_type == 'gated':
-        from ligate.gated3d import GatedPixelCNN3D as PixelCNN3D 
+        from ligate.bigated3d import BiGatedPixelCNN3D as PixelCNN3D 
         print("it's gated")
     
     ## Load data 
@@ -63,10 +63,8 @@ def train():
         model_params['save_root'] = args.save_root 
     if args.nb_res_blocks:
         model_params['nb_res_blocks'] = int(args.nb_res_blocks)
-    if args.nb_filters_h:
-        model_params['nb_filters_h'] = int(args.nb_filters_h)
-    if args.nb_filters_d:
-        model_params['nb_filters_d'] = int(args.nb_filters_d)
+    if args.nb_filters:
+        model_params['nb_filters'] = int(args.nb_filters)
     if args.filter_size_1st:
         model_params['filter_size_1st'] = tuple(map(int, args.filter_size_1st.split(',')))
     if args.filter_size:
@@ -77,17 +75,12 @@ def train():
         model_params['dropout'] = strtobool(args.dropout)
     if args.loss:
         model_params['loss'] = args.loss
-        ## Make class weights if the loss requires weights 
-        if args.loss == 'weighted_categorical_crossentropy':
-            class_weights = compute_class_weight('balanced', np.arange(256), X_train[:].flatten())
-            model_params['class_weights'] = class_weights 
     if args.es_patience:
         model_params['es_patience'] = int(args.patience)
     if args.save_best_only:
         model_params['save_best_only'] = strtobool(args.save_best_only)
     if args.pad:
         model_params['pad'] = strtobool(args.pad)
-    
     
     save_root = args.save_root if args.save_root else r'results\pixelcnn3d'
     if not os.path.exists(save_root):
@@ -109,10 +102,13 @@ def train():
     
     # Print and export the parameters being used 
     pixelcnn.print_train_parameters(save_root)
-    pixelcnn.export_train_parameters(save_root)
+    if not continue_training:
+        pixelcnn.export_train_parameters(save_root)
     
     
     ## Train the model using a generator 
+    min_size = tuple(map(int, args.min_mask_size.split(',')))
+    max_size = tuple(map(int, args.max_mask_size.split(',')))
     random_rotation = strtobool(args.random_rotation) if args.random_rotation else True 
     random_flip = strtobool(args.random_flip) if args.random_flip else True 
     target_size = tuple(map(int, args.target_size.split(','))) if args.target_size else (42,42,42) 
@@ -121,11 +117,11 @@ def train():
         _,_ = normalize(os.path.join(load_data_root, 'X_train.zarr')) 
         
     if model_params['loss'] == 'discretized_mix_logistic_loss':
-        train_generator = data_generator(X_train, target_size, batch_size, load_data_root, rescale=True, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype)
-        validation_generator = data_generator(X_val, target_size, batch_size, load_data_root, rescale=True, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype) 
+        train_generator = bidirectional_generator(X_train, target_size, batch_size, load_data_root, min_size, max_size, rescale=True, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype)
+        validation_generator = bidirectional_generator(X_val, target_size, batch_size, load_data_root, min_size, max_size, rescale=True, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype) 
     else:
-        train_generator = data_generator(X_train, target_size, batch_size, load_data_root, rescale=False, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype)
-        validation_generator = data_generator(X_val, target_size, batch_size, load_data_root, rescale=False, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype)     
+        train_generator = bidirectional_generator(X_train, target_size, batch_size, load_data_root, min_size, max_size, rescale=False, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype)
+        validation_generator = bidirectional_generator(X_val, target_size, batch_size, load_data_root, min_size, max_size, rescale=False, random_rotation=random_rotation, random_flip=random_flip, dtype=dtype)     
     pixelcnn.fit_generator(train_generator=train_generator, 
                                 samples_per_epoch=int(np.ceil(len(X_train)/batch_size)), 
                                 nb_epoch=nb_epoch, 

@@ -5,6 +5,7 @@ import ligate.IO as io
 from ligate.utils import * 
 from distutils.util import strtobool
 import matplotlib.pyplot as plt 
+
 from tests.generate_incomplete_images import generate_mask
 
 
@@ -18,7 +19,7 @@ def predict():
     set_session(tf.Session(config=config))
 
     parser = argparse.ArgumentParser(description='Parse model parameters.')
-    parser.add_argument("--model_type", help="Gated or vanilla [Required]", type=str, metavar="INT")
+    parser.add_argument("--model_type", help="Gated or vanilla [Required]", type=str, metavar="TYPE")
     parser.add_argument("--checkpoint_file", help="Checkpoint file [Required]", type=str, metavar="FILE_PATH")
     parser.add_argument("--load_data_file", help="zarr file with incomplete images. [REQUIRED]",type=str, metavar="LOAD_FILE")
     parser.add_argument("--batch_size", help="Batch size at prediction (default: 1)",type=int, metavar="INT")
@@ -32,13 +33,12 @@ def predict():
     ## TODO: automatically populate these based on exported model parameters
     parser.add_argument("--loss", help="Loss function (categorical_crossentropy or discretized_mix_logistic_loss)", metavar="LOSS")
     parser.add_argument("--nb_res_blocks", help="Number of residual blocks. (default: 1)", metavar="INT")
-    parser.add_argument("--nb_filters_h", help="Number of filters for each layer (or double this amount). (default: 128)", metavar="INT")
-    parser.add_argument("--nb_filters_d", help="Number of filters for penultimate layers. (default: 1024)", metavar="INT")
+    parser.add_argument("--nb_filters", help="Number of filters for each layer (or double this amount). (default: 128)", metavar="INT")
     parser.add_argument("--filter_size_1st", help="Filter size for the first layer. (default: (7,7,7))", metavar="INT,INT,INT")
     parser.add_argument("--filter_size", help="Filter size for the subsequent layers. (default: (3,3,3))", metavar="INT,INT,INT")
     parser.add_argument("--pad", help="Whether to pad images or not (default: False)", type=str, metavar="BOOL")
     parser.add_argument("--target_size", help="Target shape of the model. (default: (42,42,42))", metavar="INT,INT,INT")
-    parser.add_argument("--dropout", help="Whether to use dropout of 0.5 or not (default: False)", type=str, metavar="BOOL")
+    parser.add_argument("--dropout", help="")
     
     args = parser.parse_args()
     temperature = float(args.temperature) if args.temperature else 1.0 
@@ -66,10 +66,8 @@ def predict():
     model_params['input_size'] = input_size
     if args.nb_res_blocks:
         model_params['nb_res_blocks'] = int(args.nb_res_blocks)
-    if args.nb_filters_h:
-        model_params['nb_filters_h'] = int(args.nb_filters_h)
-    if args.nb_filters_d:
-        model_params['nb_filters_d'] = int(args.nb_filters_d)
+    if args.nb_filters:
+        model_params['nb_filters'] = int(args.nb_filters)
     if args.filter_size_1st:
         model_params['filter_size_1st'] = tuple(map(int, args.filter_size_1st.split(',')))
     if args.filter_size:
@@ -79,13 +77,13 @@ def predict():
     if args.loss:
         model_params['loss'] = args.loss
     if args.dropout:
-        model_params['dropout'] = strtobool(args.dropout)  
+        model_params['dropout'] = strtobool(args.dropout)
     
     if args.model_type=='vanilla':
         from ligate.models import PixelCNN3D
         print("it's not gated")
     elif args.model_type=='gated':
-        from ligate.gated3d import GatedPixelCNN3D as PixelCNN3D
+        from ligate.bigated3d import BiGatedPixelCNN3D as PixelCNN3D
         print("it's gated")
     pixelcnn = PixelCNN3D(**model_params)
     pixelcnn.build_model()
@@ -114,14 +112,11 @@ def predict():
     
     ## This is just for testing: on an image we know has salient information 
     X_incomplete = X_incomplete[311:312]
-    
-    
-    
     for k in range(nb_images//2):
         X_incomplete = np.concatenate((X_incomplete, X_incomplete),axis=0)
     X_pred_same = X_incomplete.copy() 
     
-    # Might have to trim the image based on padding 
+    # Might have to trim the image based on padding s
     if model_params['pad']:
         X_pred = X_incomplete[:nb_images].copy()
     else:
@@ -138,30 +133,35 @@ def predict():
     # Important - we need to make sure we predict in the order of columns, rows, z (otherwise will be conditioning on wrong information) 
     inds = inds[np.lexsort((inds[:,0],inds[:,2]))]
     for i in range(len(inds)):
-        x = image2kerasarray(X_pred_same, norm_root)
-        next_X_pred = pixelcnn.model.predict(x, batch_size)
+        # x = image2kerasarray(X_pred_same, norm_root) #  normalize - or not. 
+        ## This is if we stack with ones 
+        # x = np.stack([X_pred_same, np.ones(X_pred_same.shape)], axis=-1)
+        # x_with_mask = np.stack([X_pred_same*masks[:nb_images], np.ones(X_pred_same.shape), masks[:nb_images]], axis=-1)
+        
+        
+        ## THis is if we don't stack with ones 
+        x = np.expand_dims(X_pred_same, axis=-1)
+        x_with_mask = np.stack([X_pred_same*masks[:nb_images], masks[:nb_images]] ,axis=-1)
+        
+        x_with_mask = np.rot90(np.flip(x_with_mask, axis=3), k=2, axes=(0,1))
+        next_X_pred = pixelcnn.model.predict([x, x_with_mask], batch_size)
         
         sampled_pred = next_X_pred[:,inds[i,0],inds[i,1],inds[i,2],:]
         
+        ## short experiment to see what kinds of distributions ar elearned 
+        # plt.plot(np.arange(256), sampled_pred[0])
+        # plt.show()
+        print([np.argmax(sampled_pred[l]) for l in range(nb_images)])
+        
+        
         if args.loss == 'categorical_crossentropy':
-            # short experiment to see what kinds of distributions ar elearned 
-            # plt.plot(np.arange(256), sampled_pred[0])
-            # plt.show()
-            print([np.argmax(sampled_pred[l]) for l in range(nb_images)])
             sampled_pred = np.array([sample(sampled_pred[j], temperature=temperature) for j in range(len(sampled_pred))])
-        else:
-            # short experiment to see what kinds of distributions ar elearned 
-            print("Logistic distribution means:",(1+sampled_pred[0,10:20])*127.5,"\n",
-                  "variances:",(np.exp(sampled_pred[0,20:]))*127.5,"\n",
-                  "coefficients:",np.exp(sampled_pred[0,0:10]),"\n"
-                  "coefficients sum:",np.sum(np.exp(sampled_pred[0,0:10])),"\n")
             
+        else:
             ## Sample the discretized logistic distribution 
             sampled_pred = sample_from_discretized_mix_logistic(sampled_pred, nr_mix=10)
-            
-            
-        print("Predicted intensities:",[sampled_pred[l] for l in range(nb_images)],"\nActual intensity:",X_incomplete[0,inds[i,0],inds[i,1],inds[i,2]])
-            
+        # print("Predicted intensity:",sampled_pred[0],"Actual intensity:",X_incomplete[0,inds[i,0],inds[i,1],inds[i,2]])
+        print("Predicted intensities:",[sampled_pred[l] for l in range(nb_images)],"\nActual intensity:",X_incomplete[0,inds[i,0],inds[i,1],inds[i,2]])    
         X_pred[:,inds[i,0],inds[i,1],inds[i,2]] = sampled_pred # output size image 
         if model_params['pad']:
             X_pred_same[:,inds[i,0],inds[i,1],inds[i,2]] = sampled_pred
