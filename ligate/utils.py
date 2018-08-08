@@ -1,3 +1,5 @@
+from __future__ import print_function
+
 import numpy as np
 import ligate.IO as io 
 from keras.utils import to_categorical
@@ -5,10 +7,38 @@ import time, zarr, os, random
 from sklearn.model_selection import train_test_split 
 import tensorflow as tf 
 from keras import backend as K
+import matplotlib.pyplot as plt 
+
 
 # Contains neural network and preprocessing tools 
 
+class IndexTracker(object):
+    def __init__(self, ax, X):
+        self.ax = ax
+        ax.set_title('use scroll wheel to navigate images')
 
+        self.X = X
+        rows, cols, self.slices = X.shape
+        self.ind = self.slices//2
+
+        self.im = ax.imshow(self.X[:, :, self.ind])
+        self.update()
+
+    def onscroll(self, event):
+        print("%s %s" % (event.button, event.step))
+        if event.button == 'up':
+            self.ind = (self.ind + 1) % self.slices
+        else:
+            self.ind = (self.ind - 1) % self.slices
+        self.update()
+
+    def update(self):
+        self.im.set_data(self.X[:, :, self.ind])
+        self.ax.set_ylabel('slice %s' % self.ind)
+        self.im.axes.figure.canvas.draw()
+
+
+    
 def make_image_chunks_3d(img, desired_shape, overlap, save_dir):
     ''' 
     Makes 3D image chunks based on how much overlap is required (depending on padding and architecture)
@@ -20,6 +50,7 @@ def make_image_chunks_3d(img, desired_shape, overlap, save_dir):
     overlap - (x,y,z) tuple of the desired pixel overlap between chunks. 
             It is assumed that the padding on edge cases will be half of that. 
     save_dir - if not None, then is the directory in which to save the chunks. If None, don't save 
+    
     
     Outputs:
     img_chunks - if save_dir is None, then all of the img chunks will be returned, otherwise we save to the save_dir 
@@ -48,9 +79,9 @@ def make_image_chunks_3d(img, desired_shape, overlap, save_dir):
     # Add extra 0's at end so that we have just the right dimensions. 
     padded_img = np.pad(padded_img, ((0, extra_padding[0]),(0, extra_padding[1]),(0, extra_padding[2])), 'constant') 
     
-    print(start_points[0])
-    print(start_points[1])
-    print(start_points[2])
+    print("Start x coords",start_points[0])
+    print("Start y coords",start_points[1])
+    print("Start z coords",start_points[2])
     
     if save_dir is None:
         img_chunks = np.zeros((len(start_points[0]), len(start_points[1]), len(start_points[2]), desired_shape[0], desired_shape[1], desired_shape[2]),dtype='uint16')
@@ -84,10 +115,25 @@ def stitch_image_chunks():
     '''
     
     pass
+
+def _filter_dark_images(X, filter_dark_threshold):
+    '''
+    Decides whether to use a particular image chunk for training or not 
+    If it's too dark, then we don't use it 
+    '''
+    X_all = X[:]
+    total_num = np.prod(X.shape[:len(X.shape)//2])
+    X_all = np.reshape(X_all, (total_num, X_all.shape[3], X_all.shape[4], X_all.shape[5]))
+    X_real = []
+    for x in X_all: 
+        if len(np.argwhere(x))/np.prod(x.shape) < filter_dark_threshold:
+            X_real.append(x)
+    print("Number of data samples after filtering:",len(X_real), "\nTotal number of samples:",len(X_all))
+    return np.asarray(X_real)
     
 def normalize(train_data_root, save_root=None):
     '''
-    Computes the normalization constants (mean, standard devitaion) of the training set and then 
+    Computes the normalization constants (mean, standard devitaion) of the training set and then saves it. 
     
     
     Inputs:
@@ -108,7 +154,7 @@ def normalize(train_data_root, save_root=None):
     np.save(os.path.join(save_root, 'std.npy'), std_px) 
     return mean_px, std_px 
 
-def load_train_val_data(X, test_size, save_dir, manual_shuffle=False):
+def load_train_val_data(X, test_size, save_dir, manual_shuffle=False, filter_dark_threshold=None):
     '''
     From existing zarr file, we create new zarr files for the training and validation sets. 
     
@@ -117,13 +163,17 @@ def load_train_val_data(X, test_size, save_dir, manual_shuffle=False):
     test_size (float) - the fraction of samples to be used for the validatoin set 
     save_dir (str) - the directory under which we will save the training and validation zarr files 
     manual_shuffle (bool) - if True, then we shuffle the indices manually (this reduces memory strain). (default: False) 
+    filter_dark_threshold - if not None, then ignore the sections that have over this fraction of pixels as 0's (default: None)
     
     Outputs:
     X_train (zarr) - zarr array containing the training samples 
     X_val (zarr) - zarr array containing the validation samples 
     '''
+    if filter_dark_threshold is not None:
+        X = _filter_dark_images(X, filter_dark_threshold)
+    
     total_num = np.prod(X.shape[:len(X.shape)//2])
-    if manual_shuffle:
+    if manual_shuffle and filter_dark_threshold is None:
         if len(X.shape)//2 == 3:
             train_shape = (int(np.floor((1-test_size)*total_num)), X.shape[3], X.shape[4], X.shape[5])
             val_shape = (int(np.ceil(test_size*total_num)), X.shape[3], X.shape[4], X.shape[5])
@@ -161,11 +211,12 @@ def load_train_val_data(X, test_size, save_dir, manual_shuffle=False):
             j += 1
     else:
         X_all = X[:]
-        if len(X.shape)//2 == 3:
-            X_all = np.reshape(X_all, (total_num, X_all.shape[3], X_all.shape[4], X_all.shape[5]))
-        elif len(X.shape)//2 == 2:
-            X_all = np.reshape(X_all, (total_num, X_all.shape[2], X_all.shape[3]))
-        X_train, X_val = train_test_split(X_all, test_size=test_size, shuffle=True) 
+        if filter_dark_threshold is None:
+            if len(X.shape)//2 == 3:
+                X_all = np.reshape(X_all, (total_num, X_all.shape[3], X_all.shape[4], X_all.shape[5]))
+            elif len(X.shape)//2 == 2:
+                X_all = np.reshape(X_all, (total_num, X_all.shape[2], X_all.shape[3]))
+        X_train, X_val = train_test_split(X_all, test_size=test_size, shuffle=True)     
         if save_dir is not None:
             zarr.save(os.path.join(save_dir, 'X_train.zarr'), X_train)
             zarr.save(os.path.join(save_dir, 'X_val.zarr'), X_val) 
@@ -279,6 +330,7 @@ def data_generator(X, target_size, batch_size, save_root, rescale=False, random_
                 # print(type(new_arr), new_arr.shape)
                 new_arr = np.flip(new_arr, axis=flip_axis[0]-1)
             x[batch_idx % batch_size] = image2kerasarray(new_arr, save_root)
+            
             if rescale:
                 scaled_img = rescale_image(new_arr, bounds=[-1,1], dtype=str(new_arr.dtype))
                 y[batch_idx % batch_size] = np.expand_dims(scaled_img, axis=-1)
@@ -287,8 +339,109 @@ def data_generator(X, target_size, batch_size, save_root, rescale=False, random_
             batch_idx += 1
             if (batch_idx % batch_size) == 0:
                 yield (x, y)
+
+
+def sample_random_mask(img_shape, min_size=(5,5,5), max_size=(25,25,25)):
+    '''
+    Produces a random mask for the reverse component of bidirectional pixelCNN
+    
+    Inputs:
+    img_shape (int, int, int) - 3D image that we are masking 
+    min_size (int, int, int) - minimum size of the omitted region 
+    max_size (int, int, int) - maximum size of the omitted region 
+    
+    Outputs: 
+    masked_image (numpy ndarray) - 3D image with an extra channel for the 
+    
+    '''
+    # First we randomly generate the size of the mask 
+    mask_size = (np.random.random_integers(min_size[0], max_size[0]),
+                 np.random.random_integers(min_size[1], max_size[1]),
+                 np.random.random_integers(min_size[2], max_size[2]))
+    # Then sample the location of the mask 
+    left_corner = (np.random.random_integers(0,img_shape[0]-mask_size[0]),
+                   np.random.random_integers(0,img_shape[1]-mask_size[1]),
+                   np.random.random_integers(0,img_shape[2]-mask_size[2]))
+    mask = np.ones(img_shape, dtype='uint8')
+    mask[left_corner[0]:left_corner[0]+mask_size[0],
+         left_corner[1]:left_corner[1]+mask_size[1],
+         left_corner[2]:left_corner[2]+mask_size[2]] = 0 
+    return mask
+    
+def bidirectional_generator(X, target_size, batch_size, save_root, min_size, max_size, rescale=False, random_rotation=True, random_flip=True, dtype='uint8'):
+    '''
+    A generator for producing images from a zarr directory. 
+    
+    Inputs: 
+    X (zarr or numpy array) - containing all of the training images 
+    target_size (int, int, int) - the target shape of the arrays 
+    batch_size (int) - size of the minibatch 
+    save_root (str) - directory where mean.npy and std.npy are stored for normalization 
+    min_size (int,int,int) - minimum size of the mask 
+    max_size (int,int,int) - maximum size of the mask 
+    rescale (bool) - if True (use for discretized logistic mixture loss), then rescale it to be between -1 and 1 
+    random_rotation (bool) - if True, will randomly rotate the image 90 degrees in any direction (default: True) 
+    random_flip (bool) - if True, will randomly flip the image across any axis (default: True) 
+    dtype (str) - the data type of the labels (default: uint8) 
+    
+    Outputs:
+    ([x_f, x_r],y) - the batch of training images (forward, reverse) and associated "labels" 
+    '''
+    x_f = np.zeros((batch_size, X.shape[1], X.shape[2], X.shape[3], 1))
+    # if target_size == X.shape[1:4]:
+        # # if padding, then we need to be add channel of 1's to denote where it matters 
+        # x_f = np.concatenate((x_f, np.ones(x_f.shape)),axis=4)
+    x_r = np.concatenate((x_f.copy(), np.zeros(x_f.shape[:-1]+(1,))),axis=-1)
+    if rescale:
+        num_channels=1
+    else:
+        if isinstance(dtype, str):
+            num_channels = 2**int(dtype[-1])
+    y = np.zeros((batch_size, target_size[0], target_size[1], target_size[2], num_channels))
+    
+    while True:
+        batch_idx = 0
+        shuffled_index = list(range(len(X)))
+        random.shuffle(shuffled_index)
+        
+        # For each batch, we sample a random mask. 
+        mask = sample_random_mask(X.shape[1:4], min_size, max_size)
+        for i in shuffled_index:
+            if random_rotation:
+                k = np.random.randint(4, size=1)
+                axes = tuple(np.random.choice(range(len(X.shape)-1), size=2, replace=False)) 
+                new_arr = np.rot90(X[i], k=k, axes=axes)
+            else:
+                new_arr = X[i]
+            flip_axis = random_flip*np.random.randint(len(X.shape), size=1) # is 0 if we don't want to flip 
+            if flip_axis > 0:
+                new_arr = np.flip(new_arr, axis=flip_axis[0]-1)
                 
-                
+            ## Testing with or  without normalization 
+            # x_f[batch_idx % batch_size,:,:,:,:1] = image2kerasarray(new_arr, save_root)
+            x_f[batch_idx % batch_size,:,:,:,0] = new_arr
+            
+            # io.writeData('actual_image.tif',new_arr.astype('uint8'))
+            
+            # Add sampled random mask to the channel. 
+            x_r[batch_idx % batch_size,:,:,:,0] = np.rot90(np.flip(mask * x_f[batch_idx % batch_size,:,:,:,0], axis=2), 
+                                                           k=2, axes=(0,1))
+            # io.writeData('masked_reverse_image.tif',x_r[batch_idx%batch_size,:,:,:,0].astype('uint8'))
+            
+            x_r[batch_idx % batch_size,:,:,:,-1] = mask #np.concatenate((x_r[batch_idx % batch_size],
+                                                          #np.expand_dims(mask,axis=-1)),axis=3)
+            if rescale:
+                scaled_img = rescale_image(new_arr, bounds=[-1,1], dtype=str(new_arr.dtype))
+                y[batch_idx % batch_size] = np.expand_dims(scaled_img*(1-mask), axis=-1)
+            else:
+                ## either we take the loss only based on masked pixels or on all of them. 
+                # y[batch_idx % batch_size] = (1-np.stack([mask for q in range(256)],axis=-1))*_image2labelmap(new_arr, target_size, dtype=dtype)
+                y[batch_idx % batch_size] = _image2labelmap(new_arr, target_size, dtype=dtype)
+            batch_idx += 1
+            if (batch_idx % batch_size) == 0:
+                yield ([x_f,x_r], y)
+   
+               
 def sample(preds, temperature=1.0):
         '''
         helper function to sample an index from a probability array
@@ -327,7 +480,7 @@ def _log_prob_from_logits(x):
     m = tf.reduce_max(x, axis, keep_dims=True)
     return x - m - tf.log(tf.reduce_sum(tf.exp(x-m), axis, keep_dims=True))
     
-def discretized_mix_logistic_loss(x,l,sum_all=True):
+def discretized_mix_logistic_loss(x,l):
     """ log-likelihood for mixture of discretized logistics, assumes the data has been rescaled to [-1,1] interval """
     # xs = _int_shape(x) # true image (i.e. labels) to regress to, e.g. (B,50,50,50,1)
     # ls = _int_shape(l) # predicted distribution, e.g. (B,50,50,50,30)
@@ -366,12 +519,31 @@ def discretized_mix_logistic_loss(x,l,sum_all=True):
     log_probs = tf.where(x < -0.999, log_cdf_plus, tf.where(x > 0.999, log_one_minus_cdf_min, tf.where(cdf_delta > 1e-5, tf.log(tf.maximum(cdf_delta, 1e-12)), log_pdf_mid - np.log(127.5))))
 
     log_probs = tf.reduce_sum(log_probs,3) + _log_prob_from_logits(logit_probs)
+    lse = _log_sum_exp(log_probs)
+    
+    ## Need to determine whether to comment out the following or after that - for bidirectional
+    # return lse 
+    sum_all=True
     if sum_all:
-        return -tf.reduce_sum(_log_sum_exp(log_probs))
+        return tf.reduce_mean(-tf.reduce_sum(_log_sum_exp(log_probs)))
     else:
-        return -tf.reduce_sum(_log_sum_exp(log_probs),[1,2])
+        return tf.reduce_mean(-tf.reduce_sum(_log_sum_exp(log_probs),[1,2]))
     
-    
+
+def mix_logistic_loss(mask=None, sum_all=True):
+    '''
+    Loss for discretized mixture logistic. If there's a mask, then its a bidirectional system. 
+    '''
+    def loss(y_true, y_pred):
+        lse = discretized_mix_logistic_loss(y_true, y_pred)
+        if mask is not None:
+            lse *= (1.0-mask)
+        if sum_all:
+            out = tf.reduce_mean(-tf.reduce_sum(lse))
+        else:
+            out = tf.reduce_mean(-tf.reduce_sum(lse), [1,2,3])
+        return out
+    return loss
     
 def _unrescale_image(img, bounds=[-1,1], dtype='uint8'):
     '''
@@ -429,4 +601,12 @@ def sample_from_discretized_mix_logistic(l,nr_mix=10):
     sampled = _unrescale_image(x0)
     return sampled
     
+def sample_from_logistic_numpy(l,nr_mix=10):
+    '''
+    Personal implementation in numpy of sampling. 
+    '''
+    coeffs = l[:,:nr_mix]
+    means = l[:,nr_mix:nr_mix*2]
+    log_var = l[:,2*nr_mix:]
+    pass
     

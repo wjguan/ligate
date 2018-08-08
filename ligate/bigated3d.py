@@ -4,62 +4,17 @@ from keras import backend as K
 from keras.layers import Conv2D, Conv3D, ZeroPadding2D, ZeroPadding3D, Activation, Add, Multiply, Lambda, Input, Cropping3D, Dropout
 from keras.callbacks import ModelCheckpoint, TensorBoard, EarlyStopping
 from keras.models import Model, load_model
-from ligate.utils import discretized_mix_logistic_loss, mix_logistic_loss
-from ligate.nn import weighted_categorical_crossentropy
+from ligate.utils import discretized_mix_logistic_loss
+from ligate.gated3d import GatedCNN, GatedPixelCNN3D
+import tensorflow as tf
 
-class GatedCNN(object):
-    ''' Convolution layer with gated activation unit. '''
-
-    def __init__(
-        self,
-        nb_filters,
-        v_map=None,
-        z_map=None,
-        **kwargs):
-        '''
-        Args:
-            nb_filters (int)         : Number of the filters (feature maps)=
-            v_map (numpy.ndarray)   : Vertical maps if feeding into horizontal stack. (default:None)
-            z_map (numpy.ndarray)    : Depth maps if feeding into vertical stack. (default: None)
-        '''
-        self.nb_filters = nb_filters
-        self.v_map = v_map
-        self.z_map = z_map
-
-
-    def __call__(self, xW):
-        '''calculate gated activation maps given input maps '''
-        if self.z_map is not None:
-            xW = Add()([xW, self.z_map])
-            # To be sent to the horizontal layer 
-            xW_feed = Conv3D(2*self.nb_filters, 1, strides=(1,1,1), kernel_initializer='he_normal')(xW)
-            
-        elif self.v_map is not None:
-            xW = Add()([xW, self.v_map])
-
-        xW_f = Lambda(lambda x: x[:,:,:,:,:self.nb_filters])(xW)
-        xW_g = Lambda(lambda x: x[:,:,:,:,self.nb_filters:])(xW)
-
-        xW_f = Lambda(lambda x: K.tanh(x))(xW_f)
-        xW_g = Lambda(lambda x: K.sigmoid(x))(xW_g)
-
-        res = Multiply()([xW_f, xW_g])
-        #print(type(res), K.int_shape(res), hasattr(res, '_keras_history'))
-        
-        if self.z_map is not None:
-            return res, xW_feed # if we are sending to the horizontal layer
-        else:
-            return res 
-        
-        
-class GatedPixelCNN3D(object): 
-    ''' Test for the Gated PixelCNN 3D'''
+class BiGatedPixelCNN3D(object):
+    ''' Bidirectional gated pixel CNN.'''
     def __init__(
         self,
         input_size,
         nb_res_blocks=1,
-        nb_filters_h=128,
-        nb_filters_d=128,
+        nb_filters=128,
         filter_size_1st=(7,7,7),
         filter_size=(3,3,3),
         dropout=False,
@@ -69,8 +24,6 @@ class GatedPixelCNN3D(object):
         es_patience=100,
         save_root=r'results\pixelcnn3d',
         save_best_only=False,
-        nb_channels=1,
-        class_weights=None,
         **kwargs):
         '''
         Args:
@@ -87,15 +40,12 @@ class GatedPixelCNN3D(object):
             es_patience (int)                : Number of epochs with no improvement after which training will be stopped (EarlyStopping)
             save_root (str)                  : Root directory to which {trained model file, parameter.txt, tensorboard log file} are saved
             save_best_only (bool)            : if True, the latest best model will not be overwritten (default: False)
-            nb_channels (int)                : number of channels in input images 
-            class_weights (array)            : array containing class weights for each pixel value. 
         '''
         K.set_image_dim_ordering('tf')
 
         self.input_size = input_size
         self.nb_res_blocks = nb_res_blocks
-        self.nb_filters_h = nb_filters_h
-        self.nb_filters_d = nb_filters_d 
+        self.nb_filters = nb_filters 
         self.filter_size_1st = filter_size_1st 
         self.filter_size = filter_size
         self.loss = loss
@@ -104,8 +54,7 @@ class GatedPixelCNN3D(object):
         self.optimizer = optimizer
         self.es_patience = es_patience
         self.save_best_only = save_best_only
-        self.class_weights = class_weights 
-        # self.nb_channels = nb_channels 
+        self.save_root = save_root
 
         tensorboard_dir = os.path.join(save_root, 'pixelcnn-tensorboard')
         checkpoint_path = os.path.join(save_root, 'pixelcnn-weights.{epoch:02d}-{val_loss:.4f}.hdf5')
@@ -176,49 +125,67 @@ class GatedPixelCNN3D(object):
             res = self._crop_depth(res_d, filter_size, self.pad) 
         
         return res
-
     
         
-    def build_layers(self, x):
-        ''' Whole architecture of PixelCNN model'''
+    def build_model(self):    
+        ## Build the reverse model first. 
+        if self.pad:
+            nb_channels = 1
+        else:
+            nb_channels = 1
+        reverse_input = Input(shape=(self.input_size[0], self.input_size[1], self.input_size[2],nb_channels+1))
+        mask = Lambda(lambda x: x[:,:,:,:,-1:])(reverse_input) # get the context mask 
+        reverse_net = GatedPixelCNN3D(input_size=self.input_size,nb_res_blocks=self.nb_res_blocks,nb_filters_h=self.nb_filters,
+                                    nb_filters_d=self.nb_filters,filter_size_1st=self.filter_size_1st,filter_size=self.filter_size,
+                                    dropout=self.dropout,optimizer=self.optimizer,loss=None,es_patience=self.es_patience,
+                                    save_root=self.save_root,pad=self.pad,save_best_only=self.save_best_only)
+        x = reverse_net.build_layers(reverse_input) # loss=None ensures we get it before the final activation.
         
-        # Initial layer 
-        z = self._masked_conv(x, self.filter_size_1st, 2*self.nb_filters_h, 'depth', 0)
+        ## Foward model 
+        input_img = Input(shape=(self.input_size[0], self.input_size[1], self.input_size[2],nb_channels))
+        z = self._masked_conv(input_img, self.filter_size_1st, 2*self.nb_filters, 'depth', 10)
         # to be fed into vertical 
-        z_feed = Conv3D(2*self.nb_filters_h, 1, strides=(1,1,1), kernel_initializer='he_normal')(z)
-        z_out = GatedCNN(self.nb_filters_h)(z)
+        z_feed = Conv3D(2*self.nb_filters, 1, strides=(1,1,1), kernel_initializer='he_normal')(z)
+        z_out = GatedCNN(self.nb_filters)(z)
         if self.dropout:
             z_out = Dropout(0.5)(z_out)
         
-        v = self._masked_conv(x, self.filter_size_1st, 2*self.nb_filters_h, 'vertical', 0)
+        v = self._masked_conv(x, self.filter_size_1st, 2*self.nb_filters, 'vertical', 10)
         # to be fed into horizontal 
-        v_out, v_feed = GatedCNN(self.nb_filters_h, z_map=z_feed)(v)
+        v_out, v_feed = GatedCNN(self.nb_filters, z_map=z_feed)(v)
         if self.dropout:
             v_out = Dropout(0.5)(v_out)
         
-        h = self._masked_conv(x, self.filter_size_1st, 2*self.nb_filters_h, 'horizontal', 0, mask_type='A')
-        h_out = GatedCNN(self.nb_filters_h, v_map=v_feed)(h)
-        h_out = Conv3D(self.nb_filters_h, 1, kernel_initializer='he_normal')(h_out)
+        h = self._masked_conv(x, self.filter_size_1st, 2*self.nb_filters, 'horizontal', 10, mask_type='A')
+        h_out = GatedCNN(self.nb_filters, v_map=v_feed)(h)
+        h_out = Conv3D(self.nb_filters, 1, kernel_initializer='he_normal')(h_out)
         if self.dropout:
             h_out = Dropout(0.5)(h_out)
         
+        # Combine with the reverse PixelCNN 
+        # need to actually reverse the direction 
+        x = Lambda(lambda o: K.reverse(o,axes=[2,1,0]))(x)
+        reverse = Conv3D(self.nb_filters, 1, kernel_initializer='he_normal')(x)
+        h_out = Add()([reverse, h_out])
+        h_out = Lambda(lambda r: K.relu(r))(h_out)
+        
         for i in range(0, self.nb_res_blocks):
-            z = self._masked_conv(z_out, self.filter_size, 2*self.nb_filters_h, 'depth', i+1)
-            z_feed = Conv3D(2*self.nb_filters_h, 1, strides=(1,1,1), kernel_initializer='he_normal')(z)
+            z = self._masked_conv(z_out, self.filter_size, 2*self.nb_filters, 'depth', i+11)
+            z_feed = Conv3D(2*self.nb_filters, 1, strides=(1,1,1), kernel_initializer='he_normal')(z)
             if i != self.nb_res_blocks-1:
-                z_out = GatedCNN(self.nb_filters_h)(z)
+                z_out = GatedCNN(self.nb_filters)(z)
                 if self.dropout:
                     z_out = Dropout(0.5)(z_out)
             
-            v = self._masked_conv(v_out, self.filter_size, 2*self.nb_filters_h, 'vertical', i+1)
-            v_out, v_feed = GatedCNN(self.nb_filters_h, z_map=z_feed)(v)
+            v = self._masked_conv(v_out, self.filter_size, 2*self.nb_filters, 'vertical', i+11)
+            v_out, v_feed = GatedCNN(self.nb_filters, z_map=z_feed)(v)
             if self.dropout and i != self.nb_res_blocks-1:
                 v_out = Dropout(0.5)(v_out)
                 
             h_out_prev = h_out
-            h = self._masked_conv(h_out, self.filter_size_1st, 2*self.nb_filters_h, 'horizontal', i+1)
-            h_out = GatedCNN(self.nb_filters_h, v_map=v_feed)(h)
-            h_out = Conv3D(self.nb_filters_h, 1, kernel_initializer='he_normal')(h_out)
+            h = self._masked_conv(h_out, self.filter_size_1st, 2*self.nb_filters, 'horizontal', i+11)
+            h_out = GatedCNN(self.nb_filters, v_map=v_feed)(h)
+            h_out = Conv3D(self.nb_filters, 1, kernel_initializer='he_normal')(h_out)
             if self.dropout:
                 h_out = Dropout(0.5)(h_out)
             
@@ -227,58 +194,25 @@ class GatedPixelCNN3D(object):
                 h_out_prev = Cropping3D(cropping=((self.filter_size[0]//2, self.filter_size[0]//2),
                                          (self.filter_size[1]//2, self.filter_size[1]//2),
                                          (self.filter_size[2]//2, self.filter_size[2]//2)))(h_out_prev)
+            
+            reverse = Conv3D(self.nb_filters, 1, kernel_initializer='he_normal')(x)
+            h_out = Add()([reverse, h_out]) # reverse 
+            h_out = Lambda(lambda r: K.relu(r))(h_out) # use relu nonlinearity 
             h_out = Add()([h_out_prev, h_out]) 
         
         # FInish up 
-        h = Conv3D(self.nb_filters_d, 1, strides=(1,1,1), activation='relu', padding='valid',kernel_initializer='he_normal', name='conv_4')(h_out)
+        h = Conv3D(self.nb_filters, 1, strides=(1,1,1), activation='relu', padding='valid',kernel_initializer='he_normal')(h_out)
         if self.loss == 'discretized_mix_logistic_loss':
-            h = Conv3D(30, 1, strides=(1,1,1), activation=None, padding='valid',kernel_initializer='he_normal', name='conv_5')(h)
-        elif self.loss == 'categorical_crossentropy' or self.loss == 'weighted_categorical_crossentropy':
-            h = Conv3D(256, 1, strides=(1,1,1), activation='softmax', padding='valid',kernel_initializer='he_normal', name='conv_5')(h)
-        return h
-        
-
-    def build_model(self):
-        ''' build model '''
-        input_img = Input(shape=(self.input_size[0], self.input_size[1], self.input_size[2], 1))
-        predicted = self.build_layers(input_img)
-        self.model = Model(input_img, predicted)
+            h = Conv3D(30, 1, strides=(1,1,1), activation=None, padding='valid',kernel_initializer='he_normal')(h)
+        elif self.loss == 'categorical_crossentropy':
+            h = Conv3D(256, 1, strides=(1,1,1), activation='softmax', padding='valid',kernel_initializer='he_normal')(h)
+            # h = Lambda(lambda r: (1.0-r[1])*r[0])([h, mask]) # only condition on missing pixels 
+        self.model = Model([input_img, reverse_input], h) 
         if self.loss == 'discretized_mix_logistic_loss':
             self.model.compile(optimizer=self.optimizer, loss=discretized_mix_logistic_loss)
-        elif self.loss == 'weighted_categorical_crossentropy':
-            self.model.compile(optimizer=self.optimizer, loss=weighted_categorical_crossentropy(self.class_weights))
         else:
             self.model.compile(optimizer=self.optimizer, loss=self.loss)
-    
-
-    def fit(
-        self,
-        x,
-        y,
-        batch_size,
-        nb_epoch,
-        validation_data=None,
-        shuffle=True):
-        ''' call fit function
-        Args:
-            x (np.ndarray or [np.ndarray, np.ndarray])  : Input data for training
-            y (np.ndarray)                              : Label data for training 
-            samples_per_epoch (int)                     : Number of data for each epoch
-            nb_epoch (int)                              : Number of epoches
-            validation_data ((np.ndarray, np.ndarray))  : Validation data
-            nb_val_samples (int)                        : Number of data yielded by validation generator
-            shuffle (bool)                              : if True, shuffled randomly
-        '''
-        self.model.fit(
-            x=x,
-            y=y,
-            batch_size=batch_size,
-            nb_epoch=nb_epoch,
-            callbacks=[self.tensorboard, self.checkpointer, self.earlystopping],
-            validation_data=validation_data,
-            shuffle=shuffle
-        )
-
+        
     def fit_generator(
         self,
         train_generator,
@@ -302,43 +236,13 @@ class GatedPixelCNN3D(object):
             validation_data=validation_data,
             validation_steps=nb_val_samples
         )
-
-
-    def load_model(self, checkpoint_file):
-        ''' restore model from checkpoint file (.hdf5) '''
-        self.model = load_model(checkpoint_file)
-
-    def export_to_json(self, save_root):
-        ''' export model architecture config to json file '''
-        with open(os.path.join(save_root, 'pixelcnn_model.json'), 'w') as f:
-            f.write(self.model.to_json())
-
-    def export_to_yaml(self, save_root):
-        ''' export model architecture config to yaml file '''
-        with open(os.path.join(save_root, 'pixelcnn_model.yml'), 'w') as f:
-            f.write(self.model.to_yaml())
-
-
-    @classmethod
-    def predict(self, x, batch_size):
-        ''' generate image pixel by pixel
-        Args:
-            x (x: numpy.ndarray : x = input image)
-            batch_size (int) - batch_size for prediction 
-        Returns:
-            predict (numpy.ndarray)        : generated image
-        '''
-        
-        return self.model.predict(x, batch_size)
-
-
+    
     def print_train_parameters(self, save_root):
         ''' print parameter list file '''
         print('\n########## PixelCNN options ##########')
         print('input_size\t: %s' % (self.input_size,))
         print('nb_res_blocks\t: %s' % self.nb_res_blocks)
-        print('nb_filters_h\t: %s' % self.nb_filters_h)
-        print('nb_filters_d\t: %s' % self.nb_filters_d) 
+        print('nb_filters\t: %s' % self.nb_filters)
         print('filter_size_1st\t: %s' % (self.filter_size_1st,))
         print('filter_size\t: %s' % (self.filter_size,))
         print('pad\t\t: %s' % self.pad)
@@ -356,8 +260,7 @@ class GatedPixelCNN3D(object):
             txt_file.write('########## PixelCNN options ##########\n')
             txt_file.write('input_size\t: %s\n' % (self.input_size,))
             txt_file.write('nb_res_blocks\t: %s\n' % self.nb_res_blocks)
-            txt_file.write('nb_filters_h\t: %s\n' % self.nb_filters_h)
-            txt_file.write('nb_filters_d\t: %s\n' % self.nb_filters_d)
+            txt_file.write('nb_filters\t: %s\n' % self.nb_filters)
             txt_file.write('filter_size_1st\t: %s\n' % (self.filter_size_1st,))
             txt_file.write('filter_size\t: %s\n' % (self.filter_size,))
             txt_file.write('pad\t\t: %s\n' % self.pad)
